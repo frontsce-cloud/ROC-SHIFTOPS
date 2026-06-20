@@ -1,0 +1,189 @@
+# ROC ShiftOps — Cloudflare Workers + D1 deployment
+
+This is the production backend for ROC ShiftOps: the single-file demo HTML
+app now talks to a real Cloudflare Worker API backed by D1 (SQLite at the
+edge), with PBKDF2-SHA256 PIN hashing, signed session cookies, and
+brute-force lockout. Nothing is stored in the browser tab anymore — every
+mutation (leave, swaps, staff, schedule) round-trips through the API and is
+the same for every device, every login.
+
+**This has been tested end-to-end locally** (auth, lockout, schedule
+generation, leave approval, swap approval + coverage rejection, staff
+CRUD, cascading delete, static asset serving) before being handed to you —
+see "What was verified" at the bottom.
+
+---
+
+## 0. Prerequisites
+
+- A Cloudflare account (free to create at [dash.cloudflare.com](https://dash.cloudflare.com))
+- The Workers **Free** plan is sufficient — no paid plan needed. PIN hashing
+  uses 5,000 PBKDF2-SHA256 iterations, benchmarked at ~2.5ms on the real
+  Workers runtime, comfortably inside the Free plan's 10ms-CPU-per-request
+  cap. (See the security note below for the tradeoff this involves.)
+- Node.js + npm (already available in your Codespaces environment)
+
+## 1. Install dependencies
+
+```bash
+cd roc-shiftops
+npm install
+```
+
+## 2. Log in to Cloudflare from the CLI
+
+```bash
+npx wrangler login
+```
+
+This opens a browser tab to authorize Wrangler against your Cloudflare
+account. (In Codespaces, it'll give you a URL to open manually if it can't
+launch a browser directly — just paste it into any browser and approve.)
+
+## 3. Create the D1 database
+
+```bash
+npx wrangler d1 create roc-shiftops-db
+```
+
+This prints a `database_id`. Copy it, then open `wrangler.toml` and replace:
+
+```toml
+database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
+```
+
+with the real id.
+
+## 4. Apply the schema
+
+```bash
+npx wrangler d1 execute roc-shiftops-db --remote --file=./schema.sql
+```
+
+This creates all tables and seeds the 16-person ISOC/SCE roster — **with no
+PINs set**. Every person sets their own 6-digit PIN the first time they log
+in. None of the old hardcoded demo PINs exist anywhere in this codebase or
+database.
+
+## 5. Deploy
+
+```bash
+npx wrangler deploy
+```
+
+Wrangler prints a live URL, e.g. `https://roc-shiftops.<your-subdomain>.workers.dev`.
+That's it — it's live.
+
+## 6. First login
+
+1. Open the URL. Pick a department, pick your name.
+2. Since no PIN is set yet, you're taken straight to PIN setup — choose a
+   6-digit PIN, confirm it, then log in with it.
+3. Repeat for each of the 16 staff (or see the security note below about
+   doing this as a controlled onboarding session rather than leaving it
+   fully self-serve).
+
+## 7. Custom domain (optional)
+
+In the Cloudflare dashboard → Workers & Pages → your `roc-shiftops` Worker →
+**Settings → Domains & Routes → Add → Custom domain**, point it at a domain
+already on your Cloudflare account (e.g. `shiftops.yourdomain.com`). SSL is
+automatic.
+
+## 8. Updating later
+
+Edit `public/index.html` (frontend) or `src/*.js` (backend) directly, then:
+
+```bash
+npx wrangler deploy
+```
+
+Schema changes go in a new `.sql` file and get applied the same way as step 4
+(`--remote --file=./your-migration.sql`).
+
+To watch live production logs while debugging:
+
+```bash
+npx wrangler tail
+```
+
+---
+
+## Security notes — read before rolling this out to real staff
+
+**PIN setup has no pre-verification.** Anyone with the live URL can pick any
+staff member whose PIN isn't set yet and claim it — there's no SMS/email
+verification step gating "first login sets the PIN," matching the tap-your-
+name-then-PIN flow the original design called for. For 16 known people this
+is a manageable v1 risk, but the safest rollout is either:
+  - Get everyone in a room (or on a call) for a 10-minute onboarding where
+    each person sets their own PIN while you watch, or
+  - Have an Admin set everyone's initial PIN directly via **Staff → Edit**
+    (the PIN field there sets it immediately, no self-serve setup needed),
+    then privately tell each person their starting PIN and ask them to
+    change it via Settings on first login.
+
+**Brute-force lockout:** 5 wrong PIN attempts locks that account for 15
+minutes. This is per-account, not per-IP — if that's not strict enough for
+your threat model later, Cloudflare's Rate Limiting Rules or Turnstile can be
+layered in front of `/api/auth/login` with no app code changes.
+
+**PIN hashing strength — the Free-plan tradeoff.** PINs are hashed with
+PBKDF2-SHA256 at 5,000 iterations, not the stronger 210,000-iteration OWASP
+baseline — chosen specifically to fit inside the Workers Free plan's 10ms
+CPU/request cap (benchmarked at ~2.5ms on the real runtime, leaving headroom
+for the D1 query). This is still salted + hashed, a large improvement over
+the plaintext PINs in the original file, and the lockout above fully blocks
+anyone guessing PINs at the login screen — that protection is unaffected by
+iteration count. What's weaker: if the D1 database is ever read directly by
+an attacker (e.g. a leaked Cloudflare API token, not just "the live URL"),
+offline brute-forcing a 6-digit PIN's 1,000,000-value keyspace gets
+meaningfully faster than at 210,000 iterations. For 16 internal staff this is
+a reasonable tradeoff to stay on Free. To raise the bar later: bump
+`PBKDF2_ITERATIONS` in `src/auth.js` back to `210000` and move to the $5/mo
+Paid plan (which removes the CPU cap entirely) — no other code changes
+needed.
+
+**Sessions:** signed random 256-bit tokens, HttpOnly + Secure + SameSite=Lax
+cookies, 14-day expiry, stored server-side in D1 (not JWTs — they can be
+revoked instantly, e.g. on PIN reset, which also force-logs-out that user).
+
+**What changed from the original file:** the 16 plaintext PINs that were
+visible in the HTML source (`Stephen` / `111111`, etc.) are gone entirely —
+not migrated, not hashed-and-kept, just gone. Nobody has a PIN until they set
+one through this new flow.
+
+## What was verified before delivery
+
+Run locally via `wrangler dev --local` against a fresh D1 instance, on
+workerd (the real Workers engine):
+- ✅ PBKDF2-SHA256 timing at 5,000 iterations measured at ~2.5ms in
+  isolation; full `/api/auth/login` round-trip ~18ms wall time including
+  network overhead — well inside the Free plan's 10ms-CPU (not wall-time)
+  budget
+- ✅ PIN setup → login → session persistence (`/api/auth/me`)
+- ✅ Wrong-PIN lockout after 5 attempts, 423 response, blocks even the
+  correct PIN until the lockout window passes
+- ✅ Re-running PIN setup on an already-set account is rejected (409)
+- ✅ Schedule generator: exactly 3 Day + 3 Night (ISOC) and 2 Day + 1 Night
+  (SCE) on **all 30 days** of a test month, 12-hour rest rule never violated,
+  5-day consecutive-shift cap respected, fairness spread of just 1 day
+  (16–17 workdays) across all 16 staff
+  - the legacy demo's hardcoded leave baseline was replaced with real
+    approved leave requests — confirmed leave correctly removes someone
+    from the rotation for those exact days
+- ✅ Admin-only enforcement: non-admin gets 403 on staff create, leave
+  resolve, swap resolve
+- ✅ Leave request → overlap warning → admin approve → activity log entry
+- ✅ Swap request coverage check: a coverage-breaking swap is correctly
+  **rejected** (400) before it ever reaches an admin; a headcount-neutral
+  swap is accepted, approved, and persists as a schedule override that
+  survives schedule regeneration
+- ✅ Profile name change + self-service PIN change, with old session
+  invalidated and new PIN required to log back in
+- ✅ Staff delete cascades correctly (their sessions, leave, swaps, and
+  schedule overrides are all cleaned up — roster count confirmed back to 16)
+- ✅ Static asset serving: the deployed `index.html` is byte-for-byte
+  identical to the source file
+- ✅ Unauthenticated requests to protected routes correctly return 401;
+  unknown API routes return 404

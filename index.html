@@ -1,0 +1,356 @@
+import {
+  hashPin, verifyPin, sessionCookie, clearCookie,
+  createSession, getSessionStaff, destroySession,
+  LOCKOUT_THRESHOLD, LOCKOUT_MINUTES,
+} from './auth.js';
+import { generateSchedule, applyOverrides, checkSwapCoverage } from './schedule.js';
+import * as db from './db.js';
+
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...headers },
+  });
+}
+function err(message, status = 400) {
+  return json({ error: message }, status);
+}
+
+function isValidPin(pin) { return typeof pin === 'string' && /^\d{6}$/.test(pin); }
+function isValidDept(d) { return d === 'ISOC' || d === 'SCE'; }
+function isValidRole(r) { return r === 'Staff' || r === 'Admin'; }
+function isValidName(n) { return typeof n === 'string' && n.trim().length > 0 && n.trim().length <= 100; }
+function isValidDate(s) { return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s); }
+
+function shapeUser(row) {
+  return { id: row.id, name: row.name, dept: row.dept, role: row.role, color: row.color, pinSet: !!row.pin_set };
+}
+function dateParts(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return { year: y, month: m - 1, day: d };
+}
+
+async function readJson(request) {
+  try { return await request.json(); } catch (e) { return null; }
+}
+
+// Computes the full schedule (generated + approved-swap overrides applied)
+// for one month. Shared by /api/schedule and the swap coverage checks.
+async function computeMonthSchedule(database, year, month) {
+  const staffList = await db.listStaff(database);
+  const leaveDaysMap = await db.approvedLeaveDaysForMonth(database, year, month);
+  const { schedule, covering } = generateSchedule(staffList, leaveDaysMap, year, month);
+  const overrides = await db.overridesForMonth(database, year, month);
+  applyOverrides(schedule, covering, overrides);
+  return { schedule, covering, staffList };
+}
+
+function deriveCovering(staffList, staffId, shift) {
+  const dept = staffList.find(s => s.id === staffId)?.dept;
+  return dept === 'SCE' && (shift === 'D' || shift === 'N');
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+    const database = env.DB;
+
+    if (!path.startsWith('/api/')) {
+      return env.ASSETS.fetch(request);
+    }
+
+    try {
+      // ── Auth ──────────────────────────────────────────────
+      if (path === '/api/auth/login' && method === 'POST') {
+        const body = await readJson(request);
+        if (!body || typeof body.staffId !== 'string' || !isValidPin(body.pin)) {
+          return err('Invalid request');
+        }
+        const staff = await db.getStaffRaw(database, body.staffId);
+        if (!staff) return err('Invalid login', 401);
+
+        if (staff.locked_until && new Date(staff.locked_until) > new Date()) {
+          const mins = Math.ceil((new Date(staff.locked_until) - new Date()) / 60000);
+          return err(`Too many attempts. Try again in ${mins}m.`, 423);
+        }
+        if (!staff.pin_set) return err('PIN not set for this account', 400);
+
+        const valid = await verifyPin(body.pin, staff.pin_salt, staff.pin_hash);
+        if (!valid) {
+          const result = await db.recordFailedAttempt(database, staff);
+          if (result.locked) return err(`Too many incorrect attempts. Locked for ${LOCKOUT_MINUTES} minutes.`, 423);
+          return err('Incorrect PIN. Try again.', 401);
+        }
+
+        await db.clearFailedAttempts(database, staff.id);
+        const token = await createSession(database, staff.id);
+        return json({ user: shapeUser(staff) }, 200, { 'Set-Cookie': sessionCookie(token) });
+      }
+
+      if (path === '/api/auth/setup-pin' && method === 'POST') {
+        const body = await readJson(request);
+        if (!body || typeof body.staffId !== 'string' || !isValidPin(body.pin)) {
+          return err('Invalid request');
+        }
+        const staff = await db.getStaffRaw(database, body.staffId);
+        if (!staff) return err('Staff member not found', 404);
+        if (staff.pin_set) return err('PIN already set for this account. Use "Forgot PIN" via your admin instead.', 409);
+
+        const { hash, salt } = await hashPin(body.pin);
+        await db.setStaffPin(database, staff.id, hash, salt);
+        return json({});
+      }
+
+      if (path === '/api/auth/me' && method === 'GET') {
+        const staff = await getSessionStaff(database, request);
+        if (!staff) return err('Not logged in', 401);
+        return json({ user: shapeUser(staff) });
+      }
+
+      if (path === '/api/auth/logout' && method === 'POST') {
+        await destroySession(database, request);
+        return json({}, 200, { 'Set-Cookie': clearCookie() });
+      }
+
+      // ── Pre-login roster (no auth) ──────────────────────────────────────────────
+      if (path === '/api/staff/roster' && method === 'GET') {
+        return json(await db.loginRoster(database));
+      }
+
+      // Everything below requires a valid session.
+      const currentUser = await getSessionStaff(database, request);
+      if (!currentUser) return err('Not logged in', 401);
+      const isAdmin = currentUser.role === 'Admin';
+
+      // ── Staff ──────────────────────────────────────────────
+      if (path === '/api/staff' && method === 'GET') {
+        return json(await db.listStaff(database));
+      }
+
+      if (path === '/api/staff' && method === 'POST') {
+        if (!isAdmin) return err('Admin only', 403);
+        const body = await readJson(request);
+        if (!body || !isValidName(body.name) || !isValidDept(body.dept) || !isValidRole(body.role)) {
+          return err('Invalid staff data');
+        }
+        if (body.pin !== undefined && body.pin !== '' && !isValidPin(body.pin)) {
+          return err('PIN must be exactly 6 digits');
+        }
+        const id = await db.createStaff(database, { name: body.name.trim(), dept: body.dept, role: body.role });
+        if (body.pin) {
+          const { hash, salt } = await hashPin(body.pin);
+          await db.setStaffPin(database, id, hash, salt);
+        }
+        await db.logActivity(database, 'info', '👤', `${body.name.trim()} added to ${body.dept}`, `Added by Admin ${currentUser.name}`);
+        return json({ id });
+      }
+
+      let m;
+      if ((m = path.match(/^\/api\/staff\/([^/]+)\/reset-pin$/)) && method === 'POST') {
+        if (!isAdmin) return err('Admin only', 403);
+        const staffId = decodeURIComponent(m[1]);
+        const staff = await db.getStaffRaw(database, staffId);
+        if (!staff) return err('Staff member not found', 404);
+        await db.resetStaffPin(database, staffId);
+        await db.logActivity(database, 'info', '🔑', `PIN reset for ${staff.name}`, `By Admin ${currentUser.name}`);
+        return json({});
+      }
+
+      if ((m = path.match(/^\/api\/staff\/([^/]+)$/)) && method === 'PUT') {
+        if (!isAdmin) return err('Admin only', 403);
+        const staffId = decodeURIComponent(m[1]);
+        const existing = await db.getStaffRaw(database, staffId);
+        if (!existing) return err('Staff member not found', 404);
+        const body = await readJson(request);
+        if (!body || !isValidName(body.name) || !isValidDept(body.dept) || !isValidRole(body.role)) {
+          return err('Invalid staff data');
+        }
+        if (body.pin !== undefined && body.pin !== '' && !isValidPin(body.pin)) {
+          return err('PIN must be exactly 6 digits');
+        }
+        const deptChanged = existing.dept !== body.dept;
+        await db.updateStaff(database, staffId, { name: body.name.trim(), dept: body.dept, role: body.role });
+        if (body.pin) {
+          const { hash, salt } = await hashPin(body.pin);
+          await db.setStaffPin(database, staffId, hash, salt);
+        }
+        await db.logActivity(
+          database, 'info', '👤',
+          deptChanged ? `${body.name.trim()} moved to ${body.dept}` : `${body.name.trim()} updated`,
+          `Updated by Admin ${currentUser.name}`
+        );
+        return json({});
+      }
+
+      if ((m = path.match(/^\/api\/staff\/([^/]+)$/)) && method === 'DELETE') {
+        if (!isAdmin) return err('Admin only', 403);
+        const staffId = decodeURIComponent(m[1]);
+        const staff = await db.getStaffRaw(database, staffId);
+        if (!staff) return err('Staff member not found', 404);
+        await db.deleteStaffCascade(database, staffId);
+        await db.logActivity(database, 'warn', '👤', `${staff.name} removed`, `Removed by Admin ${currentUser.name}`);
+        return json({});
+      }
+
+      // ── Schedule ──────────────────────────────────────────────
+      if (path === '/api/schedule' && method === 'GET') {
+        const year = parseInt(url.searchParams.get('year'), 10);
+        const month = parseInt(url.searchParams.get('month'), 10);
+        if (!Number.isInteger(year) || !Number.isInteger(month) || month < 0 || month > 11) {
+          return err('Invalid year/month');
+        }
+        const { schedule, covering } = await computeMonthSchedule(database, year, month);
+        return json({ ...schedule, __covering: covering });
+      }
+
+      // ── Leave ──────────────────────────────────────────────
+      if (path === '/api/leave' && method === 'GET') {
+        return json(await db.listLeave(database));
+      }
+
+      if (path === '/api/leave' && method === 'POST') {
+        const body = await readJson(request);
+        if (!body || !isValidDate(body.from) || !isValidDate(body.to) || !isValidName(body.type)) {
+          return err('Invalid leave request');
+        }
+        if (new Date(body.to) < new Date(body.from)) return err('End date is before start date');
+        const days = Math.max(1, Math.round((new Date(body.to) - new Date(body.from)) / 86400000) + 1);
+        const reason = typeof body.reason === 'string' ? body.reason.slice(0, 500) : '';
+
+        await db.createLeaveRequest(database, {
+          staffId: currentUser.id, name: currentUser.name, dept: currentUser.dept,
+          from: body.from, to: body.to, days, type: body.type, reason,
+        });
+        const overlap = await db.maxLeaveOverlap(database, body.from, body.to, null);
+        await db.logActivity(database, 'warn', '🌿', `Leave Request — ${currentUser.name}`, `${days} days · ${currentUser.dept}`);
+        return json({ overlap });
+      }
+
+      if ((m = path.match(/^\/api\/leave\/(\d+)\/resolve$/)) && method === 'POST') {
+        if (!isAdmin) return err('Admin only', 403);
+        const id = parseInt(m[1], 10);
+        const body = await readJson(request);
+        if (!body || (body.status !== 'approved' && body.status !== 'rejected')) return err('Invalid status');
+        const req = await db.getLeaveRequest(database, id);
+        if (!req) return err('Leave request not found', 404);
+
+        if (body.status === 'approved') {
+          const overlap = await db.maxLeaveOverlap(database, req.from, req.to, req.id);
+          if (overlap.count > 2) {
+            return err(`Blocked — would put ${overlap.count} people on leave at once (${overlap.date}). Max is 2.`, 409);
+          }
+        }
+        await db.resolveLeaveRequest(database, id, body.status);
+        await db.logActivity(
+          database, body.status === 'approved' ? 'ok' : 'err', body.status === 'approved' ? '✓' : '✗',
+          `Leave ${body.status === 'approved' ? 'Approved' : 'Rejected'} — ${req.name}`,
+          `${req.days} days · ${req.dept}`
+        );
+        return json({ request: await db.getLeaveRequest(database, id) });
+      }
+
+      // ── Swaps ──────────────────────────────────────────────
+      if (path === '/api/swaps' && method === 'GET') {
+        return json(await db.listSwaps(database));
+      }
+
+      if (path === '/api/swaps' && method === 'POST') {
+        const body = await readJson(request);
+        if (!body || typeof body.to !== 'string' || !isValidDate(body.fromDate) || !isValidDate(body.toDate)) {
+          return err('Invalid swap request');
+        }
+        const toStaff = await db.getStaffRaw(database, body.to);
+        if (!toStaff) return err('Colleague not found', 404);
+        if (toStaff.id === currentUser.id) return err('Cannot swap with yourself');
+
+        const fp = dateParts(body.fromDate), tp = dateParts(body.toDate);
+        const sameMonth = fp.year === tp.year && fp.month === tp.month;
+        const monthA = await computeMonthSchedule(database, fp.year, fp.month);
+        const monthB = sameMonth ? monthA : await computeMonthSchedule(database, tp.year, tp.month);
+
+        const actualFromShift = monthA.schedule[currentUser.id]?.[fp.day];
+        const actualToShift = monthB.schedule[toStaff.id]?.[tp.day];
+        if (!actualFromShift || !actualToShift) return err('Could not read current schedule for those dates');
+
+        const check = checkSwapCoverage(
+          monthA.staffList, monthA.schedule, fp.day, currentUser.id, actualToShift,
+          monthB.schedule, tp.day, toStaff.id, actualFromShift
+        );
+        if (check.broken) return err(`This swap would break coverage: ${check.problems[0]}`, 400);
+
+        await db.createSwapRequest(database, {
+          from: currentUser.id, fromName: currentUser.name, to: toStaff.id, toName: toStaff.name,
+          fromDate: body.fromDate, fromShift: actualFromShift, toDate: body.toDate, toShift: actualToShift,
+        });
+        await db.logActivity(database, 'info', '⇄', `Swap Request — ${currentUser.name} → ${toStaff.name}`, 'Awaiting agreement');
+        return json({});
+      }
+
+      if ((m = path.match(/^\/api\/swaps\/(\d+)\/resolve$/)) && method === 'POST') {
+        if (!isAdmin) return err('Admin only', 403);
+        const id = parseInt(m[1], 10);
+        const body = await readJson(request);
+        if (!body || (body.status !== 'approved' && body.status !== 'rejected')) return err('Invalid status');
+        const swapReq = await db.getSwapRequest(database, id);
+        if (!swapReq) return err('Swap request not found', 404);
+
+        if (body.status === 'approved') {
+          const fp = dateParts(swapReq.fromDate), tp = dateParts(swapReq.toDate);
+          const sameMonth = fp.year === tp.year && fp.month === tp.month;
+          const monthA = await computeMonthSchedule(database, fp.year, fp.month);
+          const monthB = sameMonth ? monthA : await computeMonthSchedule(database, tp.year, tp.month);
+
+          const actualFromShift = monthA.schedule[swapReq.from]?.[fp.day];
+          const actualToShift = monthB.schedule[swapReq.to]?.[tp.day];
+          if (!actualFromShift || !actualToShift) {
+            return err('One of these staff members is no longer on the roster', 409);
+          }
+
+          const check = checkSwapCoverage(
+            monthA.staffList, monthA.schedule, fp.day, swapReq.from, actualToShift,
+            monthB.schedule, tp.day, swapReq.to, actualFromShift
+          );
+          if (check.broken) return err(`Blocked — coverage rule violated: ${check.problems[0]}`, 409);
+
+          await db.upsertOverride(database, swapReq.from, swapReq.fromDate, actualToShift, deriveCovering(monthA.staffList, swapReq.from, actualToShift));
+          await db.upsertOverride(database, swapReq.to, swapReq.toDate, actualFromShift, deriveCovering(monthB.staffList, swapReq.to, actualFromShift));
+          await db.resolveSwapRequest(database, id, 'approved');
+          await db.logActivity(database, 'ok', '⇄', `Swap Approved — ${swapReq.fromName} ↔ ${swapReq.toName}`, 'Schedule updated');
+        } else {
+          await db.resolveSwapRequest(database, id, 'rejected');
+          await db.logActivity(database, 'err', '⇄', `Swap Rejected — ${swapReq.fromName} ↔ ${swapReq.toName}`, 'Request declined');
+        }
+        return json({ request: await db.getSwapRequest(database, id) });
+      }
+
+      // ── Activities ──────────────────────────────────────────────
+      if (path === '/api/activities' && method === 'GET') {
+        const limit = Math.min(50, parseInt(url.searchParams.get('limit'), 10) || 20);
+        return json(await db.listActivities(database, limit));
+      }
+
+      // ── Profile ──────────────────────────────────────────────
+      if (path === '/api/profile' && method === 'PUT') {
+        const body = await readJson(request);
+        if (!body || !isValidName(body.name)) return err('Invalid name');
+        await db.updateProfileName(database, currentUser.id, body.name.trim());
+        return json({});
+      }
+
+      if (path === '/api/profile/change-pin' && method === 'POST') {
+        const body = await readJson(request);
+        if (!body || !isValidPin(body.newPin)) return err('PIN must be exactly 6 digits');
+        const { hash, salt } = await hashPin(body.newPin);
+        await db.setStaffPin(database, currentUser.id, hash, salt);
+        return json({});
+      }
+
+      return err('Not found', 404);
+    } catch (e) {
+      console.error('Unhandled error:', e);
+      return err('Internal server error', 500);
+    }
+  },
+};
